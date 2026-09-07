@@ -78,8 +78,12 @@ def analyze_market(market):
 
         best = None
 
+        # 최근 2시간(5분봉 24개) 안에서 발생한 V1만 검색
+        # 단, V1 이전의 20개 봉은 기준 거래량 계산에 사용
+        start_i = max(20, len(candles) - 24)
+
         # V1 후보 탐색
-        for i in range(20, len(candles) - 2):
+        for i in range(start_i, len(candles) - 2):
             base = statistics.median(vol[i-20:i])
             recent3 = statistics.median(vol[i-3:i])
 
