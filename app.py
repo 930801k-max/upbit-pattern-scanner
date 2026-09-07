@@ -1,138 +1,159 @@
-from flask import Flask, jsonify
-import requests
+import threading
 import statistics
 import time
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import requests
+from flask import Flask, jsonify, render_template_string
 
 app = Flask(__name__)
 
-UPBIT = "https://api.upbit.com/v1"
+API = "https://api.upbit.com/v1"
+SCAN = {"running": False, "done": 0, "total": 0, "data": [], "error": None}
 
-BASE_BARS = 20
-V1_MULT = 5.0
-MIN_R = 1.0
-MAX_R = 7.0
-MIN_V2_RATIO = 0.70
-MAX_LOOKAHEAD = 16
-MAX_DRAWDOWN = 0.05
+# 평가 기준
+def score_pattern(v1_mult, drawdown, r, v2_ratio, breakout):
+    score = 0
 
-SCAN = {
-    "running": False,
-    "done": False,
-    "data": [],
-    "error": None,
-    "started": 0,
-    "finished": 0,
-    "progress": 0,
-    "total": 0,
-}
-LOCK = threading.Lock()
+    # ① V1 강도
+    if v1_mult >= 8: score += 15
+    elif v1_mult >= 5: score += 10
+    elif v1_mult >= 3: score += 5
+
+    # ② V1 이후 가격 유지
+    if drawdown >= -0.01: score += 15
+    elif drawdown >= -0.03: score += 10
+    elif drawdown >= -0.05: score += 5
+
+    # ③ R = V1 이후 V2 직전 누적거래량 / V1
+    if r >= 3 and r < 5: score += 20
+    elif r >= 2 and r < 3: score += 15
+    elif r >= 5 and r < 7: score += 10
+    elif r >= 1 and r < 2: score += 5
+    elif r >= 7: score += 3
+
+    # ④ V2 / V1
+    if v2_ratio >= 1.0 and v2_ratio < 1.3: score += 15
+    elif v2_ratio >= 1.3: score += 10
+    elif v2_ratio >= 0.7: score += 10
+    elif v2_ratio >= 0.5: score += 5
+
+    # ⑤ 신고점 돌파
+    if breakout: score += 10
+
+    if score >= 75: grade = "🔥 최상급"
+    elif score >= 60: grade = "🟢 강한 패턴"
+    elif score >= 45: grade = "🟡 관심 패턴"
+    elif score >= 30: grade = "🟠 약한 패턴"
+    else: grade = "🔴 제외"
+
+    return score, grade
 
 
-def get_markets():
-    r = requests.get(
-        f"{UPBIT}/market/all",
-        params={"isDetails": "false"},
-        timeout=10,
-    )
+def get_krw_markets():
+    r = requests.get(API + "/market/all",
+                     params={"isDetails": "false"}, timeout=10)
     r.raise_for_status()
-    return [x["market"] for x in r.json()
-            if x["market"].startswith("KRW-")]
+    return [x["market"] for x in r.json() if x["market"].startswith("KRW-")]
 
 
-def analyze(market):
+def analyze_market(market):
     try:
         r = requests.get(
-            f"{UPBIT}/candles/minutes/15",
+            API + "/candles/minutes/5",
             params={"market": market, "count": 120},
-            timeout=10,
+            timeout=10
         )
         r.raise_for_status()
         candles = list(reversed(r.json()))
 
-        if len(candles) < BASE_BARS + 8:
+        # 마지막 봉은 진행 중일 수 있으므로 제외
+        if len(candles) > 1:
+            candles = candles[:-1]
+
+        if len(candles) < 30:
             return None
 
-        volume = [float(x["candle_acc_trade_volume"]) for x in candles]
+        vol = [float(x["candle_acc_trade_volume"]) for x in candles]
         close = [float(x["trade_price"]) for x in candles]
         high = [float(x["high_price"]) for x in candles]
-        times = [x["candle_date_time_kst"] for x in candles]
 
         best = None
 
-        for i in range(BASE_BARS, len(candles) - 3):
-            base = statistics.median(volume[i-BASE_BARS:i])
-            if base <= 0:
+        # V1 후보 탐색
+        for i in range(20, len(candles) - 2):
+            base = statistics.median(vol[i-20:i])
+            recent3 = statistics.median(vol[i-3:i])
+
+            if base <= 0 or recent3 <= 0:
                 continue
 
-            v1_mult = volume[i] / base
-            if v1_mult < V1_MULT:
+            v1_mult = vol[i] / base
+            recent_spike = vol[i] / recent3
+
+            # 강한 V1
+            if v1_mult < 5 or recent_spike < 2:
                 continue
 
-            v1 = volume[i]
             p1 = close[i]
 
-            for j in range(i + 2,
-                           min(i + MAX_LOOKAHEAD + 1, len(candles))):
-
+            # V1 이후 V2 탐색
+            for j in range(i + 2, min(i + 17, len(candles))):
+                # V1 이후 가격 최대 하락폭
                 dd = min(close[i:j]) / p1 - 1
-                if dd < -MAX_DRAWDOWN:
+
+                if dd < -0.05:
                     break
 
-                mid = volume[i+1:j]
-                if not mid:
+                middle = vol[i+1:j]
+
+                # V1 직후 거래량이 어느 정도 수축되는지
+                if middle and statistics.mean(middle) >= v1_mult * base * 0.75:
                     continue
 
-                if sum(mid) / len(mid) >= v1 * 0.75:
+                # R: V2 제외, V1 다음 봉부터 V2 직전까지
+                r_value = sum(middle) / vol[i] if vol[i] > 0 else 0
+
+                if r_value < 1 or r_value > 7:
                     continue
 
-                v2 = volume[j]
-                v2_ratio = v2 / v1
-
-                if v2_ratio < MIN_V2_RATIO:
+                v2_ratio = vol[j] / vol[i] if vol[i] > 0 else 0
+                if v2_ratio < 0.5:
                     continue
 
-                if high[j] <= max(high[i:j]):
+                # V2가 V1 이후 구간의 고점을 돌파하는지
+                prior_high = max(high[i:j])
+                breakout = high[j] > prior_high
+
+                if not breakout:
                     continue
 
-                R = sum(mid) / v1
-                if not (MIN_R <= R <= MAX_R):
+                # V2 자체도 최근 거래량보다 강한지
+                local = vol[max(0, j-20):j]
+                local_med = statistics.median(local) if local else 0
+                if local_med <= 0 or vol[j] < local_med * 3:
                     continue
 
-                local_start = max(0, j - BASE_BARS)
-                local = statistics.median(volume[local_start:j])
-
-                if local <= 0 or v2 < local * 3:
-                    continue
-
-                score = (
-                    min(v1_mult, 12) * 2
-                    + min(R, 5) * 1.5
-                    + min(v2_ratio, 1.6) * 2
+                score, grade = score_pattern(
+                    v1_mult, dd, r_value, v2_ratio, breakout
                 )
 
-                if dd >= -0.03:
-                    score += 1
-                if v2_ratio >= 1:
-                    score += 1
-
-                result = {
+                item = {
                     "market": market,
-                    "time_v1": times[i],
-                    "time_v2": times[j],
+                    "score": score,
+                    "grade": grade,
                     "price": close[j],
                     "v1_mult": round(v1_mult, 2),
-                    "r": round(R, 2),
+                    "recent_spike": round(recent_spike, 2),
+                    "drawdown": round(dd * 100, 2),
+                    "r": round(r_value, 2),
                     "v2_ratio": round(v2_ratio, 2),
-                    "drawdown_pct": round(dd * 100, 2),
-                    "breakout": True,
-                    "score": round(score, 2),
+                    "v1_volume": round(vol[i], 2),
+                    "middle_volume": round(sum(middle), 2),
+                    "v2_volume": round(vol[j], 2),
+                    "time": candles[j]["candle_date_time_kst"]
                 }
 
-                if best is None or result["score"] > best["score"]:
-                    best = result
-                break
+                if best is None or score > best["score"]:
+                    best = item
 
         return best
 
@@ -140,196 +161,111 @@ def analyze(market):
         return None
 
 
-def background_scan():
+def run_scan():
+    global SCAN
     try:
-        markets = get_markets()
-
-        with LOCK:
-            SCAN["total"] = len(markets)
-            SCAN["progress"] = 0
+        markets = get_krw_markets()
+        SCAN["total"] = len(markets)
+        SCAN["done"] = 0
+        SCAN["data"] = []
+        SCAN["error"] = None
 
         results = []
-
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = [executor.submit(analyze, market)
-                       for market in markets]
-
-            for future in as_completed(futures):
-                try:
-                    result = future.result()
-                    if result:
-                        results.append(result)
-                except Exception:
-                    pass
-
-                with LOCK:
-                    SCAN["progress"] += 1
+        for market in markets:
+            result = analyze_market(market)
+            if result:
+                results.append(result)
+            SCAN["done"] += 1
 
         results.sort(key=lambda x: x["score"], reverse=True)
-
-        with LOCK:
-            SCAN["data"] = results[:10]
-            SCAN["done"] = True
-            SCAN["running"] = False
-            SCAN["finished"] = time.time()
+        SCAN["data"] = results[:30]
 
     except Exception as e:
-        with LOCK:
-            SCAN["error"] = str(e)
-            SCAN["done"] = True
-            SCAN["running"] = False
-            SCAN["finished"] = time.time()
+        SCAN["error"] = str(e)
+    finally:
+        SCAN["running"] = False
 
 
 @app.route("/")
 def home():
-    return """<!doctype html>
+    return render_template_string("""
+<!doctype html>
 <html lang="ko">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Upbit 15분봉 패턴 스캐너</title>
+<title>Upbit 5분봉 패턴 스캐너</title>
 <style>
-body{font-family:sans-serif;background:#f5f5f5;margin:0;padding:18px}
-h1{font-size:25px}
-button{width:100%;padding:16px;border:0;border-radius:12px;
-background:#111;color:#fff;font-size:18px;font-weight:bold}
-button:disabled{opacity:.6}
-#status{margin:14px 0;white-space:pre-line}
-.card{background:#fff;border-radius:14px;padding:15px;margin:10px 0;
-box-shadow:0 2px 8px #ddd}
-.small{font-size:13px;color:#666;line-height:1.6}
+body{font-family:Arial,sans-serif;background:#f5f6f8;margin:0;padding:18px}
+.card{background:white;border-radius:14px;padding:16px;margin-bottom:12px;box-shadow:0 2px 8px #ddd}
+button{width:100%;padding:15px;border:0;border-radius:10px;background:#111;color:white;font-size:17px}
+.small{color:#666;font-size:13px}
+.row{display:flex;justify-content:space-between;gap:10px}
+.score{font-size:24px;font-weight:bold}
 </style>
 </head>
 <body>
-<h1>🔥 Upbit 15분봉 패턴 스캐너</h1>
-<p>V1 → 거래량 수축/가격 유지 → R → V2 → 신고점 돌파</p>
-<button id="scanButton" onclick="startScan()">🔄 지금 전체 스캔</button>
-<div id="status">대기 중입니다.</div>
+<div class="card">
+<h2>🔥 Upbit 5분봉 패턴 스캐너</h2>
+<div class="small">원화(KRW) 마켓만 검사 · V1 → R → V2 → 신고점</div>
+<br>
+<button onclick="startScan()">🔄 지금 전체 스캔</button>
+<p id="status">대기 중</p>
+</div>
 <div id="results"></div>
 
 <script>
-let timer = null;
-
 async function startScan(){
-    const s = document.getElementById("status");
-    const r = document.getElementById("results");
-    const b = document.getElementById("scanButton");
-
-    b.disabled = true;
-    r.innerHTML = "";
-    s.textContent = "⏳ 전체 KRW 종목 스캔을 시작합니다...";
-
-    try{
-        const q = await fetch("/scan/start", {cache:"no-store"});
-        const d = await q.json();
-
-        if(!q.ok){
-            throw new Error(d.error || ("HTTP " + q.status));
-        }
-
-        pollStatus();
-    }catch(e){
-        b.disabled = false;
-        s.textContent = "❌ 스캔 시작 오류\\n" + e;
-    }
+  document.getElementById("status").innerText="스캔 시작...";
+  await fetch("/scan/start",{method:"POST"});
+  poll();
 }
+async function poll(){
+  const r=await fetch("/scan/status");
+  const s=await r.json();
+  document.getElementById("status").innerText =
+    s.running ? `검사 중 ${s.done}/${s.total}` :
+    s.error ? "오류: "+s.error : `완료 ${s.total}개`;
 
-async function pollStatus(){
-    const s = document.getElementById("status");
-
-    try{
-        const q = await fetch("/scan/status", {cache:"no-store"});
-        const d = await q.json();
-
-        if(d.running){
-            s.textContent =
-                "⏳ 전체 종목 분석 중...\\n" +
-                d.progress + " / " + d.total + " 종목 처리";
-            timer = setTimeout(pollStatus, 1000);
-            return;
-        }
-
-        if(d.error){
-            document.getElementById("scanButton").disabled = false;
-            s.textContent = "❌ 서버 오류\\n" + d.error;
-            return;
-        }
-
-        showResults(d.data);
-
-    }catch(e){
-        timer = setTimeout(pollStatus, 2000);
-    }
+  if(!s.running) render(s.data);
+  else setTimeout(poll,1000);
 }
-
-function showResults(data){
-    const s = document.getElementById("status");
-    const r = document.getElementById("results");
-    const b = document.getElementById("scanButton");
-
-    b.disabled = false;
-
-    if(!data.length){
-        s.textContent = "⚠️ 현재 조건에 맞는 종목이 없습니다.";
-        return;
-    }
-
-    s.textContent = "✅ 스캔 완료 — 상위 " + data.length + "개";
-
-    r.innerHTML = data.map((x,i)=>`
-        <div class="card">
-            <b>#${i+1} ${x.market}</b>
-            <div>가격: ${Number(x.price).toLocaleString()}</div>
-            <div>V1: ${x.v1_mult}배</div>
-            <div>R: ${x.r}</div>
-            <div>V2/V1: ${x.v2_ratio}배</div>
-            <div>V1→V2 최대하락: ${x.drawdown_pct}%</div>
-            <div>V2 신고점 돌파: ✅</div>
-            <div>점수: ${x.score}</div>
-            <div class="small">
-                V1 ${x.time_v1}<br>
-                V2 ${x.time_v2}
-            </div>
-        </div>
-    `).join("");
+function render(data){
+  const el=document.getElementById("results");
+  if(!data.length){el.innerHTML='<div class="card">조건을 만족하는 종목이 없습니다.</div>';return;}
+  el.innerHTML=data.map(x=>`
+  <div class="card">
+    <div class="row"><b>${x.market}</b><span class="score">${x.score}점</span></div>
+    <b>${x.grade}</b><br><br>
+    가격: ${x.price}<br>
+    V1: ${x.v1_mult}배 (직전3봉 대비 ${x.recent_spike}배)<br>
+    가격 최대하락: ${x.drawdown}%<br>
+    <b>R: ${x.r}</b>　(V1→V2 직전 누적 ${x.middle_volume})<br>
+    V2/V1: ${x.v2_ratio}배<br>
+    V1 거래량: ${x.v1_volume}<br>
+    V2 거래량: ${x.v2_volume}<br>
+    신고점 돌파: ✅<br>
+    <span class="small">${x.time}</span>
+  </div>`).join("");
 }
 </script>
 </body>
-</html>"""
+</html>
+""")
 
 
-@app.route("/scan/start")
+@app.post("/scan/start")
 def scan_start():
-    with LOCK:
-        if SCAN["running"]:
-            return jsonify({"ok": True, "message": "이미 스캔 중입니다."})
-
-        SCAN["running"] = True
-        SCAN["done"] = False
-        SCAN["data"] = []
-        SCAN["error"] = None
-        SCAN["started"] = time.time()
-        SCAN["finished"] = 0
-        SCAN["progress"] = 0
-        SCAN["total"] = 0
-
-    threading.Thread(target=background_scan, daemon=True).start()
-
-    return jsonify({"ok": True, "message": "스캔을 시작했습니다."})
+    if SCAN["running"]:
+        return jsonify({"ok": True, "message": "이미 검사 중입니다."})
+    SCAN["running"] = True
+    threading.Thread(target=run_scan, daemon=True).start()
+    return jsonify({"ok": True})
 
 
-@app.route("/scan/status")
+@app.get("/scan/status")
 def scan_status():
-    with LOCK:
-        return jsonify({
-            "running": SCAN["running"],
-            "done": SCAN["done"],
-            "data": SCAN["data"],
-            "error": SCAN["error"],
-            "progress": SCAN["progress"],
-            "total": SCAN["total"],
-        })
+    return jsonify(SCAN)
 
 
 if __name__ == "__main__":
