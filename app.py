@@ -1,15 +1,14 @@
-#!/usr/bin/env python3
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify
 import requests
-import pandas as pd
+import statistics
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = Flask(__name__)
 
-BASE = "https://api.upbit.com/v1"
+UPBIT = "https://api.upbit.com/v1"
 
-# ---- Scanner settings ----
 BASE_BARS = 20
 V1_MULT = 5.0
 MIN_R = 1.0
@@ -17,268 +16,321 @@ MAX_R = 7.0
 MIN_V2_RATIO = 0.70
 MAX_LOOKAHEAD = 16
 MAX_DRAWDOWN = 0.05
-TOP_N = 20
 
-# Upbit candle API is limited to 10 requests/sec per IP.
-# Keep workers below that limit.
-WORKERS = 8
+SCAN = {
+    "running": False,
+    "done": False,
+    "data": [],
+    "error": None,
+    "started": 0,
+    "finished": 0,
+    "progress": 0,
+    "total": 0,
+}
+LOCK = threading.Lock()
 
-def get_session():
-    s = requests.Session()
-    s.headers.update({"Accept": "application/json", "User-Agent": "UpbitPatternScanner/1.0"})
-    return s
 
 def get_markets():
-    s = get_session()
-    r = s.get(
-        f"{BASE}/market/all",
+    r = requests.get(
+        f"{UPBIT}/market/all",
         params={"isDetails": "false"},
-        timeout=15,
+        timeout=10,
     )
     r.raise_for_status()
-    data = r.json()
-    return [x["market"] for x in data if x["market"].startswith("KRW-")]
+    return [x["market"] for x in r.json()
+            if x["market"].startswith("KRW-")]
 
-def get_candles(market):
-    s = get_session()
-    r = s.get(
-        f"{BASE}/candles/minutes/15",
-        params={"market": market, "count": 200},
-        timeout=15,
-    )
-    r.raise_for_status()
-    data = r.json()
-    if not isinstance(data, list):
-        raise RuntimeError("Upbit returned non-list candle data")
-    return pd.DataFrame(data)
 
-def scan_market(market):
-    df = get_candles(market)
+def analyze(market):
+    try:
+        r = requests.get(
+            f"{UPBIT}/candles/minutes/15",
+            params={"market": market, "count": 120},
+            timeout=10,
+        )
+        r.raise_for_status()
+        candles = list(reversed(r.json()))
 
-    if len(df) < BASE_BARS + 5:
+        if len(candles) < BASE_BARS + 8:
+            return None
+
+        volume = [float(x["candle_acc_trade_volume"]) for x in candles]
+        close = [float(x["trade_price"]) for x in candles]
+        high = [float(x["high_price"]) for x in candles]
+        times = [x["candle_date_time_kst"] for x in candles]
+
+        best = None
+
+        for i in range(BASE_BARS, len(candles) - 3):
+            base = statistics.median(volume[i-BASE_BARS:i])
+            if base <= 0:
+                continue
+
+            v1_mult = volume[i] / base
+            if v1_mult < V1_MULT:
+                continue
+
+            v1 = volume[i]
+            p1 = close[i]
+
+            for j in range(i + 2,
+                           min(i + MAX_LOOKAHEAD + 1, len(candles))):
+
+                dd = min(close[i:j]) / p1 - 1
+                if dd < -MAX_DRAWDOWN:
+                    break
+
+                mid = volume[i+1:j]
+                if not mid:
+                    continue
+
+                if sum(mid) / len(mid) >= v1 * 0.75:
+                    continue
+
+                v2 = volume[j]
+                v2_ratio = v2 / v1
+
+                if v2_ratio < MIN_V2_RATIO:
+                    continue
+
+                if high[j] <= max(high[i:j]):
+                    continue
+
+                R = sum(mid) / v1
+                if not (MIN_R <= R <= MAX_R):
+                    continue
+
+                local_start = max(0, j - BASE_BARS)
+                local = statistics.median(volume[local_start:j])
+
+                if local <= 0 or v2 < local * 3:
+                    continue
+
+                score = (
+                    min(v1_mult, 12) * 2
+                    + min(R, 5) * 1.5
+                    + min(v2_ratio, 1.6) * 2
+                )
+
+                if dd >= -0.03:
+                    score += 1
+                if v2_ratio >= 1:
+                    score += 1
+
+                result = {
+                    "market": market,
+                    "time_v1": times[i],
+                    "time_v2": times[j],
+                    "price": close[j],
+                    "v1_mult": round(v1_mult, 2),
+                    "r": round(R, 2),
+                    "v2_ratio": round(v2_ratio, 2),
+                    "drawdown_pct": round(dd * 100, 2),
+                    "breakout": True,
+                    "score": round(score, 2),
+                }
+
+                if best is None or result["score"] > best["score"]:
+                    best = result
+                break
+
+        return best
+
+    except Exception:
         return None
 
-    df = df.sort_values("candle_date_time_kst").reset_index(drop=True)
 
-    v = pd.to_numeric(df["candle_acc_trade_volume"], errors="coerce")
-    close = pd.to_numeric(df["trade_price"], errors="coerce")
-    high = pd.to_numeric(df["high_price"], errors="coerce")
+def background_scan():
+    try:
+        markets = get_markets()
 
-    if v.isna().any() or close.isna().any() or high.isna().any():
-        return None
+        with LOCK:
+            SCAN["total"] = len(markets)
+            SCAN["progress"] = 0
 
-    best = None
+        results = []
 
-    # V1 -> volume contraction/holding -> V2
-    for i in range(BASE_BARS, len(df) - 2):
-        baseline = v.iloc[i-BASE_BARS:i].median()
-        if baseline <= 0:
-            continue
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(analyze, market)
+                       for market in markets]
 
-        v1 = float(v.iloc[i])
-        v1_mult = v1 / baseline
+            for future in as_completed(futures):
+                try:
+                    result = future.result()
+                    if result:
+                        results.append(result)
+                except Exception:
+                    pass
 
-        if v1_mult < V1_MULT:
-            continue
+                with LOCK:
+                    SCAN["progress"] += 1
 
-        p1 = float(close.iloc[i])
+        results.sort(key=lambda x: x["score"], reverse=True)
 
-        for j in range(i + 2, min(i + MAX_LOOKAHEAD + 1, len(df))):
-            # Require at least one meaningful contraction candle before V2.
-            middle = v.iloc[i+1:j]
-            if len(middle) == 0:
-                continue
+        with LOCK:
+            SCAN["data"] = results[:10]
+            SCAN["done"] = True
+            SCAN["running"] = False
+            SCAN["finished"] = time.time()
 
-            middle_max = float(middle.max())
-            if middle_max > v1 * 0.90:
-                continue
+    except Exception as e:
+        with LOCK:
+            SCAN["error"] = str(e)
+            SCAN["done"] = True
+            SCAN["running"] = False
+            SCAN["finished"] = time.time()
 
-            v2 = float(v.iloc[j])
-            v2_ratio = v2 / v1
-
-            vcum = float(middle.sum())
-            R = vcum / v1 if v1 else 0.0
-
-            min_price = float(close.iloc[i+1:j+1].min())
-            drawdown = min_price / p1 - 1.0
-
-            if drawdown < -MAX_DRAWDOWN:
-                continue
-
-            if not (MIN_R <= R <= MAX_R):
-                continue
-
-            if v2_ratio < MIN_V2_RATIO:
-                continue
-
-            pre_v2_high = float(high.iloc[i:j].max())
-            breakout = float(high.iloc[j]) > pre_v2_high
-
-            # Score: V1 strength + accumulation R + V2 strength + price retention + breakout
-            score = 0.0
-
-            score += min(20.0, max(0.0, 10.0 + (v1_mult - 5.0) * 3.0))
-
-            if 2.0 <= R <= 5.0:
-                score += 25.0
-            elif 1.0 <= R < 2.0:
-                score += 15.0
-            else:
-                score += 18.0
-
-            score += min(20.0, max(0.0, v2_ratio * 15.0))
-
-            # Less drawdown = better retention
-            retention_score = max(0.0, 15.0 * (1.0 - abs(drawdown) / MAX_DRAWDOWN))
-            score += min(15.0, retention_score)
-
-            if breakout:
-                score += 15.0
-
-            candidate = {
-                "market": market.replace("KRW-", ""),
-                "v1_mult": round(v1_mult, 2),
-                "R": round(R, 2),
-                "v2_ratio": round(v2_ratio, 2),
-                "drawdown": round(drawdown * 100, 2),
-                "breakout": breakout,
-                "price": float(close.iloc[j]),
-                "score": round(score, 1),
-                "v1_time": df.loc[i, "candle_date_time_kst"],
-                "v2_time": df.loc[j, "candle_date_time_kst"],
-            }
-
-            if best is None or candidate["score"] > best["score"]:
-                best = candidate
-
-            # Use the first valid V2 after each V1.
-            break
-
-    return best
-
-HTML = r"""
-<!doctype html>
-<html lang="ko">
-<head>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Upbit Pattern Scanner</title>
-<style>
-body{font-family:system-ui,sans-serif;margin:0;background:#f5f6f8;color:#171717}
-header{background:#111;color:white;padding:18px}
-h1{margin:0;font-size:21px}
-main{padding:12px}
-button{width:100%;padding:16px;border:0;border-radius:12px;background:#111;color:white;font-size:17px;margin:15px 0}
-button:disabled{opacity:.55}
-#status{padding:8px;color:#555;white-space:pre-wrap}
-.card{background:white;border-radius:16px;padding:16px;margin:10px 0;box-shadow:0 2px 10px #00000010}
-.rank{font-size:19px;font-weight:700}
-.score{float:right;font-size:18px}
-.row{display:flex;justify-content:space-between;margin-top:9px}
-.label{color:#777}.value{font-weight:600}
-.good{color:#16803c}.bad{color:#c0392b}
-.small{font-size:12px;color:#888;margin-top:10px}
-</style>
-</head>
-<body>
-<header><h1>🔥 Upbit 15분봉 패턴 스캐너</h1></header>
-<main>
-<button id="scanBtn" onclick="scan()">🔄 지금 전체 스캔</button>
-<div id="status">스캔 버튼을 눌러주세요.</div>
-<div id="results"></div>
-</main>
-<script>
-async function scan(){
-  const s=document.getElementById('status');
-  const btn=document.getElementById('scanBtn');
-  btn.disabled=true;
-  s.textContent='⏳ 업비트 KRW 종목을 스캔하고 있습니다...';
-  document.getElementById('results').innerHTML='';
-
-  try{
-    const r=await fetch('/scan', {cache:'no-store'});
-    const text=await r.text();
-
-    let data;
-    try{
-      data=JSON.parse(text);
-    }catch(parseError){
-      throw new Error('서버가 JSON 대신 오류 페이지를 반환했습니다.\\nHTTP '+r.status+'\\n잠시 후 다시 눌러주세요.');
-    }
-
-    if(!r.ok || data.error){
-      throw new Error(data.error || ('HTTP '+r.status));
-    }
-
-    s.textContent=`✅ ${data.count}개 패턴 발견 · ${data.elapsed}초`;
-
-    document.getElementById('results').innerHTML=data.results.map((x,i)=>`
-      <div class="card">
-        <span class="rank">${i+1}. ${x.market}</span>
-        <span class="score">⭐ ${x.score}</span>
-        <div class="row"><span class="label">V1</span><span class="value">${x.v1_mult}배</span></div>
-        <div class="row"><span class="label">누적 R</span><span class="value">${x.R}배</span></div>
-        <div class="row"><span class="label">V2 / V1</span><span class="value">${x.v2_ratio}배</span></div>
-        <div class="row"><span class="label">V1 이후 하락</span><span class="value">${x.drawdown}%</span></div>
-        <div class="row"><span class="label">고점 돌파</span><span class="${x.breakout?'good':'bad'}">${x.breakout?'✅ YES':'❌ NO'}</span></div>
-        <div class="row"><span class="label">V2 가격</span><span class="value">${Number(x.price).toLocaleString()}</span></div>
-        <div class="small">${x.v1_time} → ${x.v2_time}</div>
-      </div>`).join('');
-  }catch(e){
-    s.textContent='❌ '+e.message;
-  }finally{
-    btn.disabled=false;
-  }
-}
-</script>
-</body>
-</html>
-"""
 
 @app.route("/")
 def home():
-    return render_template_string(HTML)
+    return """<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Upbit 15분봉 패턴 스캐너</title>
+<style>
+body{font-family:sans-serif;background:#f5f5f5;margin:0;padding:18px}
+h1{font-size:25px}
+button{width:100%;padding:16px;border:0;border-radius:12px;
+background:#111;color:#fff;font-size:18px;font-weight:bold}
+button:disabled{opacity:.6}
+#status{margin:14px 0;white-space:pre-line}
+.card{background:#fff;border-radius:14px;padding:15px;margin:10px 0;
+box-shadow:0 2px 8px #ddd}
+.small{font-size:13px;color:#666;line-height:1.6}
+</style>
+</head>
+<body>
+<h1>🔥 Upbit 15분봉 패턴 스캐너</h1>
+<p>V1 → 거래량 수축/가격 유지 → R → V2 → 신고점 돌파</p>
+<button id="scanButton" onclick="startScan()">🔄 지금 전체 스캔</button>
+<div id="status">대기 중입니다.</div>
+<div id="results"></div>
 
-@app.route("/health")
-def health():
-    return jsonify({"ok": True})
+<script>
+let timer = null;
 
-@app.route("/scan")
-def scan():
-    start = time.time()
+async function startScan(){
+    const s = document.getElementById("status");
+    const r = document.getElementById("results");
+    const b = document.getElementById("scanButton");
 
-    try:
-        markets = get_markets()
-    except Exception as e:
+    b.disabled = true;
+    r.innerHTML = "";
+    s.textContent = "⏳ 전체 KRW 종목 스캔을 시작합니다...";
+
+    try{
+        const q = await fetch("/scan/start", {cache:"no-store"});
+        const d = await q.json();
+
+        if(!q.ok){
+            throw new Error(d.error || ("HTTP " + q.status));
+        }
+
+        pollStatus();
+    }catch(e){
+        b.disabled = false;
+        s.textContent = "❌ 스캔 시작 오류\\n" + e;
+    }
+}
+
+async function pollStatus(){
+    const s = document.getElementById("status");
+
+    try{
+        const q = await fetch("/scan/status", {cache:"no-store"});
+        const d = await q.json();
+
+        if(d.running){
+            s.textContent =
+                "⏳ 전체 종목 분석 중...\\n" +
+                d.progress + " / " + d.total + " 종목 처리";
+            timer = setTimeout(pollStatus, 1000);
+            return;
+        }
+
+        if(d.error){
+            document.getElementById("scanButton").disabled = false;
+            s.textContent = "❌ 서버 오류\\n" + d.error;
+            return;
+        }
+
+        showResults(d.data);
+
+    }catch(e){
+        timer = setTimeout(pollStatus, 2000);
+    }
+}
+
+function showResults(data){
+    const s = document.getElementById("status");
+    const r = document.getElementById("results");
+    const b = document.getElementById("scanButton");
+
+    b.disabled = false;
+
+    if(!data.length){
+        s.textContent = "⚠️ 현재 조건에 맞는 종목이 없습니다.";
+        return;
+    }
+
+    s.textContent = "✅ 스캔 완료 — 상위 " + data.length + "개";
+
+    r.innerHTML = data.map((x,i)=>`
+        <div class="card">
+            <b>#${i+1} ${x.market}</b>
+            <div>가격: ${Number(x.price).toLocaleString()}</div>
+            <div>V1: ${x.v1_mult}배</div>
+            <div>R: ${x.r}</div>
+            <div>V2/V1: ${x.v2_ratio}배</div>
+            <div>V1→V2 최대하락: ${x.drawdown_pct}%</div>
+            <div>V2 신고점 돌파: ✅</div>
+            <div>점수: ${x.score}</div>
+            <div class="small">
+                V1 ${x.time_v1}<br>
+                V2 ${x.time_v2}
+            </div>
+        </div>
+    `).join("");
+}
+</script>
+</body>
+</html>"""
+
+
+@app.route("/scan/start")
+def scan_start():
+    with LOCK:
+        if SCAN["running"]:
+            return jsonify({"ok": True, "message": "이미 스캔 중입니다."})
+
+        SCAN["running"] = True
+        SCAN["done"] = False
+        SCAN["data"] = []
+        SCAN["error"] = None
+        SCAN["started"] = time.time()
+        SCAN["finished"] = 0
+        SCAN["progress"] = 0
+        SCAN["total"] = 0
+
+    threading.Thread(target=background_scan, daemon=True).start()
+
+    return jsonify({"ok": True, "message": "스캔을 시작했습니다."})
+
+
+@app.route("/scan/status")
+def scan_status():
+    with LOCK:
         return jsonify({
-            "error": "업비트 종목 목록을 가져오지 못했습니다: " + str(e)
-        }), 502
+            "running": SCAN["running"],
+            "done": SCAN["done"],
+            "data": SCAN["data"],
+            "error": SCAN["error"],
+            "progress": SCAN["progress"],
+            "total": SCAN["total"],
+        })
 
-    results = []
-    errors = 0
-
-    # Parallelize while keeping worker count below Upbit's candle request limit.
-    with ThreadPoolExecutor(max_workers=WORKERS) as executor:
-        futures = {executor.submit(scan_market, m): m for m in markets}
-
-        for future in as_completed(futures):
-            try:
-                x = future.result()
-                if x:
-                    results.append(x)
-            except Exception:
-                errors += 1
-
-    results.sort(
-        key=lambda x: (x["score"], x["R"], x["v2_ratio"]),
-        reverse=True
-    )
-
-    return jsonify({
-        "count": len(results),
-        "elapsed": round(time.time() - start, 1),
-        "errors": errors,
-        "results": results[:TOP_N]
-    })
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    app.run(host="0.0.0.0", port=10000)
